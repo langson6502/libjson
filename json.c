@@ -21,19 +21,31 @@ static json_config_context_t __json_config_ctx = {
         .realloc = realloc,
         .sprintf = sprintf,
         .printf  = printf,
-        .strdup  = strdup,
+        .strndup = strndup,
 };
 json_config_context_t *json_config_ctx = &__json_config_ctx;
 
-static inline void __json_error(char ch, char *ptr) {
-    int i = 0;
-    while ((ptr[i] != '\0') && (i < 8)) ++i;
-    char bak = ptr[i];
+const char *json_type_name[] = {
+        "JSON_NULL",
+        "JSON_BOOL",
+        "JSON_STRING",
+        "JSON_INTEGER",
+        "JSON_DECIMAL",
+        "JSON_OBJECT",
+        "JSON_ARRAY",
+};
 
-    ptr[i] = '\0';
+static inline void __json_error(char ch, char *ptr) {
+    char snippet[9];
+    int i = 0;
+    while ((ptr[i] != '\0') && (i < 8)) {
+        snippet[i] = ptr[i];
+        ++i;
+    }
+    snippet[i] = '\0';
+
     json_config_ctx->printf("found unexpected char '%c'(0x%02x) at `%s`.\n",
-            ch, ch, ptr);
-    ptr[i] = bak; // FIXME: May not be writable or has concurrency issue.
+            ch, ch, snippet);
 }
 
 #define JSON_ERROR(ch, ptr)      \
@@ -107,6 +119,32 @@ static inline char* __skip_whitespace(char *ptr) {
             ++ptr;
         else break;
     }
+    return ptr;
+}
+
+/*
+ * Only support C++-style (a.k.a. single-line) comments which start with
+ * double slash "//" and continue until the end of the line.
+ */
+static inline bool __is_ln_comment(char *ptr) {
+    return ((ptr[0] == '/') && (ptr[1] == '/'));
+}
+static inline char* __skip_ln_comment(char *ptr) {
+    if (__is_ln_comment(ptr)) {
+        ptr += 2; // skip //.
+        while ((*ptr != '\n') && (*ptr != '\0')) {
+            ++ptr;
+        }
+        if (*ptr == '\n') ++ptr;
+    }
+    return ptr;
+}
+
+static inline char* __skip_invalid_char(char *ptr) {
+    do {
+        ptr = __skip_whitespace(ptr);
+        ptr = __skip_ln_comment(ptr);
+    } while (__is_whitespace(*ptr) || __is_ln_comment(ptr));
     return ptr;
 }
 
@@ -338,19 +376,21 @@ static char* __parse_string(char *ptr, char **string) {
     } while (*(++ptr) != '\0');
 
     if (b_end_quote) {
-        *ptr = '\0';
-        *string = strdup(str);
-        *ptr = '"';
+        size_t n = (ptr - str);
+        *string = json_config_ctx->strndup(str, n);
+        JSON_CHECK_PTR(*string);
         ++ptr; // skip closing '"'.
     } else {
         char *_str = (str - 1);
+        char snippet[9];
         int i = 0;
-        while ((_str[i] != '\0') && (i < 8)) ++i;
-        char bak = _str[i];
+        while ((_str[i] != '\0') && (i < 8)) {
+            snippet[i] = ptr[i];
+            ++i;
+        }
+        snippet[i] = '\0';
 
-        _str[i] = '\0';
-        json_config_ctx->printf("no closing string quote for `%s`.\n", _str);
-        _str[i] = bak;
+        json_config_ctx->printf("no closing string quote for `%s`.\n", snippet);
 
         ptr = NULL;
     }
@@ -369,13 +409,13 @@ static char* __parse_object(char *ptr, json_node_t *json) {
     json_node_t *parent = json;
 
     ++ptr; // skip '{'.
-    ptr = __skip_whitespace(ptr);
+    ptr = __skip_invalid_char(ptr);
     if (*ptr == '}') {
         return ++ptr;
     }
 
     do {
-        ptr = __skip_whitespace(ptr);
+        ptr = __skip_invalid_char(ptr);
         if (__is_string(*ptr)) {
             char *name = NULL;
             ptr = __parse_string(ptr, &name);
@@ -399,7 +439,7 @@ static char* __parse_object(char *ptr, json_node_t *json) {
             JSON_ERROR(*ptr, ptr);
         }
 
-        ptr = __skip_whitespace(ptr);
+        ptr = __skip_invalid_char(ptr);
         if (__is_value(*ptr)) {
             ++ptr; // skip ':'.
             ptr = __parse_value(ptr, json);
@@ -426,7 +466,7 @@ static char* __parse_array(char *ptr, json_node_t *json) {
     json_node_t *parent = json;
 
     ++ptr; // skip '['.
-    ptr = __skip_whitespace(ptr);
+    ptr = __skip_invalid_char(ptr);
     if (*ptr == ']') {
         return ++ptr;
     }
@@ -462,7 +502,7 @@ static inline bool __is_value(char ch) {
 }
 
 static char* __parse_value(char *ptr, json_node_t *json) {
-    ptr = __skip_whitespace(ptr);
+    ptr = __skip_invalid_char(ptr);
 
     char ch = *ptr;
     if (__is_string(ch)) {
@@ -512,16 +552,16 @@ static char* __parse_value(char *ptr, json_node_t *json) {
         JSON_ERROR(ch, ptr);
     }
 
-    ptr = __skip_whitespace(ptr);
+    ptr = __skip_invalid_char(ptr);
     return ptr;
 }
 
-json_node_t* json_parse(const char* text) {
+json_node_t* json_parse(const char *text) {
     json_node_t *root = NULL;
     JSON_CHECK_PTR(text);
 
     char *ptr = (char *)text;
-    ptr = __skip_whitespace(ptr);
+    ptr = __skip_invalid_char(ptr);
 
     if (__is_object(*ptr)) {
         root = __json_node_new(JSON_OBJECT, NULL);
@@ -689,11 +729,17 @@ static int __json_stringify(const json_node_t *json, bool b_pretty, uint32_t dep
             break;
         }
         case JSON_INTEGER:
-            pl += json_config_ctx->sprintf(pl, "%lld", json->value.integer);
+            pl += json_config_ctx->sprintf(pl, "%ld", json->value.integer);
             break;
-        case JSON_DECIMAL:
-            pl += json_config_ctx->sprintf(pl, "%f", json->value.decimal);
+        case JSON_DECIMAL: {
+            /* Keep at least one digit after dot. */
+            char *_pl = pl;
+            pl += sprintf(pl, "%g", json->value.decimal);
+            if (!strchr(_pl, '.')) {
+                pl += sprintf(pl, ".0");
+            }
             break;
+        }
         case JSON_STRING:
             // FIXME: strlen(json->string) may be very big.
             pl += json_config_ctx->sprintf(pl, "\"%s\"", json->value.string);
@@ -752,4 +798,38 @@ char* json_stringify(const json_node_t *root, bool b_pretty) {
     JSON_CHECK_ERR_v2(__json_stringify(root, b_pretty, 0, ctx));
 
     return ctx->buffer;
+}
+
+char* json_minify(const char *text) {
+    JSON_CHECK_PTR(text);
+
+#if 1
+    json_node_t *root = json_parse(text);
+    JSON_CHECK_PTR(root);
+
+    char *minified = json_stringify(root, false);
+    json_free(&root);
+#else
+    char *minified = (char *)json_config_ctx->
+            malloc(strlen(text) + 1);
+    JSON_CHECK_PTR(minified);
+
+    // FIXME: comments.
+
+    char *from = (char *)text, *to = minified;
+    bool b_string = false;
+    while (*from != '\0') {
+        if (*from == '"' && *(from - 1) != '\\') {
+            b_string = !b_string;
+        }
+        if (!b_string && __is_whitespace(*from)) {
+            ++from;
+        } else {
+            *to++ = *from++;
+        }
+    }
+    *to = '\0';
+#endif
+
+    return minified;
 }
